@@ -1,11 +1,314 @@
 ---
-title: "beautiful_maps"
+title: "Choropleth Maps"
+title-block-banner: true
+toc: true
+toc-location: right
+toc-title: "Content"
+
+format: 
+  html: 
+    grid: 
+      sidebar-width: 200px
+      body-width: 1030px
+      #margin-width: 70px
+      code-fold: true
+      code-summary: "Show the code"
+    theme: 
+      - style.scss
+    code-fold: true
+    code-summary: "Show the code"
+    #page-layout: custom
+fig-align: center
 ---
-
-This is a Quarto website.
-
-To learn more about Quarto websites visit <https://quarto.org/docs/websites>.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, include = FALSE, echo = FALSE)
+```
 
 ```{r}
-1 + 1
+library(tidyverse)
+library(reactable)
+library(tigris)
+library(leaflet)
+library(sf)
+library(tidycensus)
+library(leaflet.extras)
+library(tm)
+options(scipen=999)
+library(apyramid)
+library(ggthemes)
+library(patchwork)
+
 ```
+
+
+## **Data**
+Race and Ethnicity data was pulled via API from the US Census. The data extraction and process can be find here: 
+The Dissimilarity index was calculated using he formula found in this article: 
+
+The clean data set includes the dissimilarity index for the White population vs Black (d_wb) and the dissimilarity index for the White population vs Hispanic (d_wh).  
+
+
+```{r }
+#| code-fold: true
+#| include: true
+#| echo: false
+
+sf_state_d <- read_rds("data_clean/segregation_dissimilarity_20240818.rds") |> 
+  select(state = name, geometry, d_wb, d_wh) |>
+  data_frame()
+
+
+sf_state_i <- readRDS("data_clean/segregation_isolation_20240818.rds") |> 
+  select(state = name, geometry, i_b, i_h) |>
+  data_frame()
+
+sf_state_segregation <- readRDS("data_clean/segregation_exposure_20240818.rds") |> 
+  select(state = name, geometry, e_h, e_b) |> 
+  data_frame()|>
+  inner_join(sf_state_d) |> 
+  inner_join(sf_state_i) |> 
+  st_sf()
+
+sf_state_segregation |>
+  select(state, d_wb, d_wh) |>
+  reactable(
+    searchable = TRUE, 
+    defaultPageSize = 5)
+```
+
+::: {.column width="100%"}
+
+\
+\
+## **Segregation**
+
+```{r }
+#| code-fold: true
+#| include: true
+#| echo: true
+
+pal1 <- colorBin(palette = "Purples", 
+                 domain = sf_state_segregation$d_wb, bins = 5, na.color = "#808080")
+pal2 <-colorBin(palette = "Blues",
+                domain = sf_state_segregation$d_wh, bins = 5, na.color = "#808080")
+# pal3 <- colorBin(palette = "Reds", 
+#                  domain = sf_state_segregation$e_b, bins = 5, na.color = "#808080")
+
+#bins = seq(round(min, 2), round(max, 2), sep)
+
+sf_state_segregation |> 
+  leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") |> 
+  addResetMapButton() %>% 
+  #fitBounds(bbox[1], bbox[2], bbox[3], bbox[4]) |> 
+  setView(-93.28260584606623,
+          39.29656858589331, zoom = 4) |> 
+  addPolygons(
+    group="White vs Black",
+    color = ~pal1(d_wb),
+    weight = 1,  # border thickness
+    opacity = 1, # border opacity
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(fillColor ="white",
+                                        bringToFront = TRUE),
+    label=~paste0(state, ": ", round(d_wb, 3)),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))
+    ) |>
+  addPolygons(
+    group="White vs Hispanic", 
+    color = ~pal2(d_wh),
+    weight = 1,  # border thickness
+    opacity = 1, # border opacity
+    fillOpacity = 0.8,
+    highlightOptions = highlightOptions(fillColor ="white",
+                                        bringToFront = TRUE),
+    label=~paste0(state, ": ", round(d_wh, 2)),
+    labelOptions = labelOptions(style = list("font-size" = "12px"))) |> 
+    addLegend("bottomright", pal = pal2, values = ~sf_state_segregation$d_wh,
+    title = "Dissiminarity Index",
+    opacity = 1, group="White vs Hispanic", bins = 5) |> 
+  
+  addLegend("bottomright", pal = pal1, values = ~sf_state_segregation$d_wb,
+    title = "Dissiminarity Index",
+    opacity = 1, group="White vs Black", bins = 5) |>
+  
+
+  
+  addLayersControl(baseGroups = c(
+                                  "White vs Black", 
+                                  "White vs Hispanic"),
+                   position="bottomleft",
+                   options = layersControlOptions(collapsed = F))
+  
+
+```
+:::
+
+\
+\
+
+
+```{r}
+gini_state_data <- get_acs(
+  geography = "state", 
+  variables = c(
+    "B19083_001"), 
+  year = 2019,
+  output = "wide", 
+  geometry = TRUE) |>
+  select(
+    state = GEOID, 
+    name = NAME, 
+    incom_ineq_gini = B19083_001E
+    )
+
+gini_county_data <- get_acs(
+  geography = "county",
+  variables= c(
+    incom_ineq_gini = "B19083_001"),
+  year=2019,
+  #output="tidy",
+  output = "wide",
+  geometry = TRUE) |> 
+  mutate(state = gsub(".*, ", "", NAME)) |> 
+  mutate(NAME = gsub(" County.*", "", NAME)) |> 
+  filter(state == "Florida") |>
+  select(
+    state, name = NAME, incom_ineq_gini = incom_ineq_giniE
+  )
+```
+
+```{r}
+
+
+state <- states(
+  year = 2019,
+  cb = TRUE,
+  class = "sf"
+  ) |>
+  filter(NAME == "Florida")
+
+# getting the box size (zoom) 
+us_main_box <- gini_state_data |> 
+  filter(name !="Hawaii") |> 
+  filter(name != "Puerto Rico") |> 
+  filter(name != "Alaska")
+
+
+zoom_us <- st_bbox(us_main_box)
+zoom_state <- st_bbox(state) 
+
+# cropping the base 
+gini_state_data_cropped <- st_crop(gini_state_data, xmin = zoom_us[[1]], #
+                         ymin = zoom_us[[2]] ,
+                         xmax = zoom_us[[3]],
+                         ymax = zoom_us[[4]])
+```
+
+```{r include=FALSE, message=FALSE, warning=FALSE}
+
+min <- min(gini_county_data$incom_ineq_gini) + 0.005
+max <- max(gini_county_data$incom_ineq_gini) -  0.005
+sep <- round(((max - min)/5), 2)
+
+map_state <- ggplot() +
+  geom_sf(data= gini_county_data, aes(fill = incom_ineq_gini),
+          color = "white") +
+  scale_fill_fermenter(
+    name = "",
+    #breaks = seq(0.40, 0.46, 0.02),
+    breaks = seq(round(min, 2), round(max, 2), sep),
+    direction = 1,
+    palette = "YlGnBu") +
+  # labs(title = params$NAME_place,
+  #      x = NULL,
+  #      y = NULL) +
+  theme_map() +
+  theme(
+    plot.title = element_text(size = 15),
+    legend.position="none",
+    # Set the legend flush with the left side of the plot, and just slightly below the top of the plot
+    # Increase size and horizontal alignment of the both the title and subtitle
+    # plot.margin = margin(t = 1,  # Top margin
+    #                          r = 4,  # Right margin
+    #                          b = 2,  # Bottom margin
+    #                          l = 2,  # Left margin
+    #                          unit = "cm"),
+    panel.border = element_rect(colour = "magenta", fill=NA, size=1)
+  )
+```
+
+
+## **Income Inequality (Gini Index)**
+
+```{r include=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+
+
+map_us <- ggplot() +
+  geom_sf(data = gini_state_data, aes(fill = incom_ineq_gini),
+          color = "white") +
+  coord_sf(xlim = c(-124.76307, -66.94989), ylim = c(24.52310, 49.38436), expand = FALSE) +
+  scale_fill_fermenter(
+    name = "",
+    breaks = seq(round(min, 2), round(max, 2), sep),
+    direction = 1,
+    palette = "YlGnBu") +
+
+  labs(title = paste0(gini_state_data$state, " state"),
+       x = NULL,
+       y = NULL) +
+  theme_map() +
+  theme(
+    plot.title = element_text(hjust = 0.5,  size = 20),
+    legend.position = "bottom",
+    legend.justification = "right",
+    legend.direction = "horizontal",
+    legend.key.size = unit(0.9, "cm"),
+    plot.margin = margin(t = 1,  # Top margin
+                             r = 1,  # Right margin
+                             b = 1.5,  # Bottom margin
+                             l = 1,  # Left margin
+                             unit = "cm")
+    ) +
+  geom_rect(aes(xmin = zoom_state[[1]]-0.04,
+                xmax = zoom_state[[3]]+0.04,
+                ymin = zoom_state[[2]]-0.04,
+                ymax = zoom_state[[4]]+0.04),
+            color = "magenta", fill = NA,
+            linewidth = 0.3)
+
+
+
+insert <-
+  inset_element(map_state, 0.1, 0.1, 0.4, 0.4,
+                           align_to = 'full'
+                           )
+
+#map_us + insert
+
+```
+
+
+
+
+```{r include=TRUE, message=FALSE, warning=FALSE}
+map_us + insert
+```
+
+
+
+
+
+
+
+
+   
+
+#### [Sources:]{.bold}
+
+###### - U.S. Census Bureau, [American county Survey 5-Year Data (2015-2019)]{.italics}. Retrieved from <https://www.census.gov/data/developers/data-sets/acs-5year.html>;
+
+###### - Kyle Walker and Matt Herman (2022). tidycensus: Load US Census Boundary and Attribute Data as 'tidyverse' and 'sf'-Ready Data Frames. R package version 1.2.2. <https://CRAN.R-project.org/package=tidycensus>;
+
+###### - Kyle Walker (2022). tigris: Load Census TIGER/Line Shapefiles. R package version 1.6.1. <https://CRAN.R-project.org/package=tigris>.
+

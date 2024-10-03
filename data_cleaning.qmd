@@ -1,0 +1,265 @@
+---
+title: "Data Cleaning"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, include = TRUE, echo = TRUE)
+```
+
+```{r load-libraries}
+library(tidycensus)
+library(tigris)
+library(tidyverse)
+library(rvest)
+library(readxl)
+library(tm)
+library(sf)
+options(scipen = 999)
+```
+
+## Getting data via the US Census API 
+I already saved my Census API key in my .Renviron. 
+
+```{r getting-acs-data}
+
+# Variables of interest: Total, White, Black, Asian, Hispanic
+
+vars <- c(
+##### TOTAL POP
+  "B03002_001", 
+  
+##### RACE & ETHNICITY
+  "B03002_003", 
+  "B03002_004",
+  "B03002_006", 
+  "B03002_012"
+)
+
+#### LARGE AREA
+sf_states <- get_acs(
+  geography = "state", 
+  variables = vars, 
+  year = 2019,
+  output = "wide", 
+  geometry = TRUE) |>
+  select(
+    state = GEOID, 
+    name = NAME, 
+    totalpop_state = B03002_001E,
+    nhw = B03002_003E, 
+    nhb = B03002_004E, 
+    nhasian = B03002_006E, 
+    hispanic = B03002_012E
+    )
+
+#### SMALL AREA
+df_tracts1 <- get_acs(
+  geography = "tract", 
+  variables = vars, 
+  year = 2019,
+  output = "wide", 
+  state = sf_states$name
+)
+df_tracts <- transmute(
+  df_tracts1,
+  state = substr(GEOID, 1, 2), tract = GEOID, name = NAME,
+  totalpop_tract = B03002_001E, nhw = B03002_003E, nhb = B03002_004E,
+  nhasian = B03002_006E, hispanic = B03002_012E
+) |>
+  select(-name) 
+
+### JOINED ZCTAS AND counties
+df_joined_data <-
+  inner_join(df_tracts, sf_states, by = "state", suffix = c("_tract", "_state"))
+```
+
+County level data for Florida 
+
+```{r}
+gini_state_data <- get_acs(
+  geography = "state", 
+  variables = c(
+    "B19083_001"), 
+  year = 2019,
+  output = "wide", 
+  geometry = TRUE) |>
+  select(
+    state = GEOID, 
+    name = NAME, 
+    incom_ineq_gini = B19083_001E
+    )
+
+gini_county_data <- get_acs(
+  geography = "county",
+  variables= c(
+    incom_ineq_gini = "B19083_001"),
+  year=2019,
+  #output="tidy",
+  output = "wide",
+  geometry = TRUE) |> 
+  mutate(state = gsub(".*, ", "", NAME)) |> 
+  mutate(NAME = gsub(" County.*", "", NAME)) |> 
+  filter(state == "Florida") |>
+  select(
+    state, name = NAME, incom_ineq_gini = incom_ineq_giniE
+  )
+
+
+```
+
+
+
+# Calculating racial sagregation
+
+# Segregation: Calculate the index of dissilimarity (D)
+
+Dissimilarity
+$$ D = \frac{1}{2} \sum_{i=1}^{n} \left|\frac{a_i}{A} - \frac{b_i}{B} \right| $$
+```{r function-dissimilarity}
+
+get_df_dissimilarity <- function(df_joined, sf_comm,
+                                 majority_tract, majority_state,
+                                 minority_tract, minority_state) {
+  df_community_d1 <- df_joined |>
+    transmute(name,
+      x = abs({{ majority_tract }} / {{ majority_state }} -
+        {{ minority_tract }} / {{ minority_state }})
+    ) |>
+    # 1/2*of the sum of x for each state
+    group_by(name) %>%
+    # so here we sum x
+    summarise(x = sum(x, na.rm = TRUE)) %>%
+    # and here we get the half of that sum per state
+    transmute(name, d = x / 2)
+
+  # Join D back to state features
+  df_community_d <-
+    inner_join(sf_comm, df_community_d1, by = "name")
+
+  return(df_community_d)
+}
+```
+
+
+```{r create-dissimilarity-county}
+# Calculate the index of dissimilarity (D) White vs Black
+dissimilarity_wb <- get_df_dissimilarity(
+  df_joined_data, sf_states, nhw_tract, nhw_state, nhb_tract, nhb_state) |>
+  rename(d_wb = d) |>
+  data_frame()
+
+# Calculate the index of dissimilarity (D) White vs Hispanic
+dissimilarity_wh <- get_df_dissimilarity(
+  df_joined_data, sf_states, nhw_tract, nhw_state, hispanic_tract, hispanic_state) |>
+  rename(d_wh = d) |>
+  data_frame()
+
+# Joining
+dissimilarity <- dissimilarity_wb |>
+  left_join(dissimilarity_wh) |>
+  select(state, name, d_wh, d_wb, geometry) |>
+  st_sf()
+  #write_rds("data_clean/segregation_dissimilarity_20240818.rds")
+
+```
+
+# Segregation: Calculate the isolation index (I) for black and hispanic
+
+Exposure 
+$$ I = \sum_{i=1}^{n} \left[(\frac{x_i}{X})  (\frac{y_i}{t_i}) \right] $$
+```{r isolation-function}
+get_df_isolation <- function(df_joined, sf_comm,
+                             minority_small_area, minority_large_area) {
+  df_name_i1 <- df_joined |>
+    transmute(name,
+      x = {{ minority_small_area }} / {{ minority_large_area }},
+      y = {{ minority_small_area }} / totalpop_tract
+    ) |>
+    transmute(name,
+      i = x * y
+    ) |>
+    # 1/2*of the sum of x for each state
+    group_by(name) %>%
+    # so here we sum x
+    summarise(i = sum(i, na.rm = TRUE))
+
+  # Join D back to state features
+  sf_name_i <- sf_comm %>%
+    as.data.frame() %>%
+    inner_join(df_name_i1, by = "name")
+  # st_sf()
+
+  return(sf_name_i)
+}
+```
+
+```{r}
+isolation_b <- get_df_isolation(df_joined_data, sf_states, nhb_tract, nhb_state) |>
+  rename(i_b = i)
+isolation_h <- get_df_isolation(df_joined_data, sf_states, hispanic_tract, hispanic_state) |>
+  rename(i_h = i)
+
+isolation <- isolation_b |>
+  left_join(isolation_h) |>
+  select(state, name, i_b, i_h, geometry) |>
+  st_sf() 
+  #write_rds("data_clean/segregation_isolation_20240818.rds")
+```
+
+# Segregation: Calculate the interaction(exposure) index (E)
+
+```{r interaction-function}
+get_df_exposure <- function(df_joined, sf_comm,
+                            minority_small_area, minority_large_area) {
+  df_name_e1 <- df_joined |>
+    transmute(name,
+      x = {{ minority_small_area }} / {{ minority_large_area }}, # minority
+      y = nhw_tract / totalpop_tract
+    ) |> # majority pop
+    transmute(name,
+      e = x * y
+    ) |>
+    # 1/2*of the sum of x for each state
+    group_by(name) %>%
+    # so here we sum x
+    summarise(e = sum(e, na.rm = TRUE))
+
+  # Join D back to state features
+  sf_name_e <- sf_comm %>%
+    as.data.frame() %>%
+    inner_join(df_name_e1, by = "name")
+  # st_sf()
+
+  return(sf_name_e)
+}
+```
+
+```{r}
+exposure_h <- get_df_exposure(df_joined_data, sf_states, hispanic_tract, hispanic_state) |>
+  rename(e_h = e)
+exposure_b <- get_df_exposure(df_joined_data, sf_states, nhb_tract, nhb_state) |>
+  rename(e_b = e)
+
+exposure <- exposure_h |>
+  left_join(exposure_b) |>
+  select(state, name, e_b, e_h, geometry) |>
+  st_sf() 
+  #write_rds("data_clean/segregation_exposure_20240818.rds")
+```
+
+
+```{r}
+# References
+# segregation
+# https://www2.census.gov/ces/wp/2022/CES-WP-22-14.pdf
+
+# dissimilarity formula
+# https://github.com/temple-geography/census-gis/blob/master/Calculating%20the%20Index%20of%20Dissimilarity.pdf
+# exposure formula
+# in docs
+
+# exposure (interaction) and isolation formula
+# https://www.census.gov/topics/housing/housing-patterns/guidance/appendix-b.html
+```
